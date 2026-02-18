@@ -1,0 +1,208 @@
+Big-picture architecture (inputs → processing → outputs)
+
+┌─────────────────────────────── INPUTS ───────────────────────────────┐
+│                                                                       │
+│  A) Meta form (Metaqueries.csv)                                       │
+│     - user types test details OR hits "Skip"                          │
+│                                                                       │
+│  B) GPS (navigator.geolocation.watchPosition)                         │
+│     - continuous location updates                                     │
+│                                                                       │
+│  C) Camera (getUserMedia)                                             │
+│     - live video stream                                               │
+│                                                                       │
+│  D) User annotations                                                  │
+│     - KPI buttons (from selected CSV)                                 │
+│     - Manual annotation button + textbox                              │
+│     - Voice control (Azure Speech SDK hotword "Annotator")            │
+│     - Editable comments in Issue list table                           │
+│                                                                       │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────── PROCESSING ──────────────────────────────┐
+│  1) App startup                                                       │
+│     loadMetaQueries() → renderMetaForm() → metaAnswers → startApp()    │
+│                                                                       │
+│  2) Live telemetry loop                                                │
+│     showPosition():                                                    │
+│       - distance (Haversine) + speed                                   │
+│       - reverse geocode (OSM Nominatim) → roadType/street/city/country │
+│       - sunrise-sunset API → day phase                                 │
+│       - weatherapi.com → weather condition + temperature               │
+│       - map polyline update + distance marker                          │
+│                                                                       │
+│  3) Sampling (periodic)                                                │
+│     recordSample():                                                    │
+│       - timestamp, lat/lon, dist, speed, legalSpeed, roadType          │
+│       - snapshot of all toggles at that moment                         │
+│                                                                       │
+│  4) Issue logging (event-driven)                                       │
+│     logButton(issueName, isRed):                                       │
+│       - reads: phase/weather/lat/lon/dist/speed/roadType/country        │
+│       - pulls textbox comment (and applies corrections.csv)            │
+│       - captures camera snapshot (or uses “early” snapshot)            │
+│       - appends to logTable[]                                          │
+│       - adds numbered map marker                                       │
+│       - recompute KPI aggregates (redCounts per issue, etc.)           │
+│       - refresh tables + snapshots                                     │
+│                                                                       │
+│  5) Upload gating + throttles                                          │
+│     uploadsEnabled = (totalDist >= 100m) OR (logTable not empty)       │
+│     maybeUpdateTables() triggers auto-upload every 5 min if enabled    │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────── OUTPUTS ────────────────────────────────┐
+│  On-screen outputs                                                    │
+│   - Sidebar telemetry (time, phase, weather, location, road type, etc.)│
+│   - Map route polyline + markers                                      │
+│   - Issue list table (editable comment + remove)                       │
+│   - KPI tables: counts, road types, country, weather, phase, stats     │
+│   - Snapshot table showing last 5 issues with map iframe + photo       │
+│                                                                       │
+│  Upload artifacts (manual button / auto / stop test)                   │
+│   - XLSX workbook: reportBaseName.xlsx                                 │
+│     sheets: Test details, Issues, KPI, Statistics, Road types, ...     │
+│     + Sampling sheet + optional Benchmark sheet (tri-toggles touched)  │
+│   - ZIP: reportBaseName.zip (all issue snapshots as images)            │
+│   - (Optional, currently commented/unused paths) PDF / HTML export     │
+│                                                                       │
+│  Destination                                                          │
+│   - Azure Blob Storage using SAS URL (PUT BlockBlob)                   │
+│   - If offline or upload fails → download locally instead              │
+└──────────────────────────────────────────────────────────────────────┘
+
+
+****************************************************************************************************************************************
+Startup flow (what happens when the page loads)
+
+window.onload
+  └─ loadMetaQueries() fetch Metaqueries.csv
+        ├─ parse CSV (PapaParse)
+        └─ renderMetaForm(questions)
+              ├─ user presses OK → metaAnswers filled from inputs
+              └─ OR presses Skip → metaAnswers all "Not filled in"
+                    └─ requestWakeLock() (screen stays awake)
+                    └─ hide overlay
+                    └─ renderMetaTable() (shows answers in "Test details")
+                    └─ startApp()
+
+****************************************************************************************************************************************
+Every GPS update calls showPosition():
+
+window.onload
+  └─ loadMetaQueries() fetch Metaqueries.csv
+        ├─ parse CSV (PapaParse)
+        └─ renderMetaForm(questions)
+              ├─ user presses OK → metaAnswers filled from inputs
+              └─ OR presses Skip → metaAnswers all "Not filled in"
+                    └─ requestWakeLock() (screen stays awake)
+                    └─ hide overlay
+                    └─ renderMetaTable() (shows answers in "Test details")
+                    └─ startApp()
+
+
+****************************************************************************************************************************************
+User “issue” creation flow (buttons / manual / voice)
+
+A) KPI buttons (from selected CSV)
+
+User selects button config (dropdown)
+  └─ buildButtons(csv)
+        ├─ PapaParse CSV
+        ├─ create columns (groupKey)
+        ├─ create:
+        │    - normal log buttons → on click: logButton(logName, isRed)
+        │    - 2-state toggles → update toggleState snapshot
+        │    - 3-state toggles → cycle Not tested → No → Yes (+ optional note)
+        └─ tri-toggle touched tracking for Benchmark sheet later
+
+
+B) Manual annotation textbox + button
+
+User starts typing in textbox
+  └─ on first non-whitespace input:
+        captureSnapshotFromCamera() → pendingSnapshotDataUrl
+
+User clicks "Manual annotation" button
+  └─ logButton("Manual annotation", false)
+        ├─ pulls comment from textbox (apply corrections.csv)
+        ├─ uses pendingSnapshotDataUrl (or captures fresh)
+        ├─ appends logTable row
+        └─ updates tables/map/snapshots
+
+
+C) Voice control (Azure)
+
+User presses "Start voice control"
+  └─ initAzureSpeech()
+        ├─ listens continuously
+        ├─ recognizing:
+        │     if phrase starts with hotword "Annotator" → show draft text
+        │     and take early snapshot once
+        └─ recognized:
+              if hotword present → set textbox to cleaned phrase
+              then logButton("Manual annotation", false)
+
+
+
+Manual upload (button)
+
+Click "Upload data to cloud"
+  └─ uploadWorkbookToAzure()
+        ├─ build XLSX with multiple sheets from DOM tables
+        ├─ add "Sampling" sheet (samplingTable + toggle snapshot columns)
+        ├─ add optional "Benchmark" sheet (only tri-toggles touched)
+        └─ PUT to Azure Blob (BlockBlob)
+            └─ if offline/fail → download locally
+
+  └─ uploadSnapshotsZip()
+        ├─ JSZip: add each logTable[i].snapshot as 1.jpg, 2.jpg...
+        └─ PUT to Azure Blob
+            └─ if offline/fail → download locally
+
+
+Auto upload (timer-based)
+
+Auto every 5 min:
+  uploadWorkbookToAzure()
+  uploadSnapshotsZip()
+
+
+End test (stop button)
+
+Click "End test"
+  └─ stopTesting()
+        ├─ freeze UI + stop timers + stop GPS watch + stop camera
+        ├─ stop Azure recognizer + release wake lock
+        ├─ final refresh of tables
+        ├─ final uploadWorkbookToAzure()
+        ├─ final uploadSnapshotsZip()
+        └─ markClean() + replace UI with "Session ended"
+
+
+****************************************************************************************************************************************
+
+A simpler “swimlane” diagram (who does what)
+
+User                  Browser App                         External Services             Azure Blob
+----                  ----------                          -----------------             ---------
+Open page  ────────▶  fetch Metaqueries.csv ───────────▶  (static file server) 
+Fill/Skip meta ───▶  metaAnswers set + startApp()
+
+Drive/Move ────────▶  GPS watchPosition → showPosition()
+                      reverse geocode ─────────────────▶  OSM Nominatim
+                      phase lookup ────────────────────▶  sunrise-sunset.org
+                      weather lookup ──────────────────▶  weatherapi.com
+
+Press KPI button ──▶  logButton() → logTable[] + marker
+Type comment ──────▶  early camera snapshot stored
+Voice "Annotator…" ▶  Azure Speech SDK recognized ─────▶  Azure Speech
+
+Manual upload ─────▶  build XLSX + ZIP
+                      PUT XLSX ───────────────────────────────────────────────────────▶  Blob (xlsx)
+                      PUT ZIP  ───────────────────────────────────────────────────────▶  Blob (zip)
+                      (if offline/fail → local download)
+
+End test ──────────▶  stop timers/GPS/camera + final uploads
